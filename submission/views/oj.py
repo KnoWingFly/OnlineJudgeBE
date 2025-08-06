@@ -45,11 +45,14 @@ class SubmissionAPI(APIView):
                 if not any(user_ip in ipaddress.ip_network(cidr, strict=False) for cidr in contest.allowed_ip_ranges):
                     return self.error("Your IP is not allowed in this contest")
 
+    # Update your existing SubmissionAPI post method in submission/views/oj.py
+
     @validate_serializer(CreateSubmissionSerializer)
     @login_required
     def post(self, request):
         data = request.data
         hide_id = False
+        
         if data.get("contest_id"):
             error = self.check_contest_permission(request)
             if error:
@@ -61,6 +64,7 @@ class SubmissionAPI(APIView):
         if data.get("captcha"):
             if not Captcha(request).check(data["captcha"]):
                 return self.error("Invalid captcha")
+        
         error = self.throttling(request)
         if error:
             return self.error(error)
@@ -69,18 +73,24 @@ class SubmissionAPI(APIView):
             problem = Problem.objects.get(id=data["problem_id"], contest_id=data.get("contest_id"), visible=True)
         except Problem.DoesNotExist:
             return self.error("Problem not exist")
+        
         if data["language"] not in problem.languages:
             return self.error(f"{data['language']} is not allowed in the problem")
-        submission = Submission.objects.create(user_id=request.user.id,
-                                               username=request.user.username,
-                                               language=data["language"],
-                                               code=data["code"],
-                                               problem_id=problem.id,
-                                               ip=request.session["ip"],
-                                               contest_id=data.get("contest_id"))
-        # use this for debug
-        # JudgeDispatcher(submission.id, problem.id).judge()
+        
+        # Create submission WITHOUT penalty calculation (signals will handle it)
+        submission = Submission.objects.create(
+            user_id=request.user.id,
+            username=request.user.username,
+            language=data["language"],
+            code=data["code"],
+            problem_id=problem.id,
+            ip=request.session["ip"],
+            contest_id=data.get("contest_id")
+            # Remove: anti_cheat_penalty_minutes=anti_cheat_penalty
+        )
+        
         judge_task.send(submission.id, problem.id)
+        
         if hide_id:
             return self.success()
         else:

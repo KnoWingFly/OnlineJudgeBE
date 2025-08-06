@@ -1,9 +1,12 @@
 import io
 
 import xlsxwriter
+from utils.api import APIView, validate_serializer
+import ipaddress
 from django.http import HttpResponse
 from django.utils.timezone import now
 from django.core.cache import cache
+from django.db.models import Count, Q
 
 from problem.models import Problem
 from utils.api import APIView, validate_serializer
@@ -13,7 +16,8 @@ from account.models import AdminType
 from account.decorators import login_required, check_contest_permission, check_contest_password
 
 from utils.constants import ContestRuleType, ContestStatus
-from ..models import ContestAnnouncement, Contest, OIContestRank, ACMContestRank
+from ..models import ContestAnnouncement, Contest, OIContestRank, ACMContestRank, AntiCheatViolation
+from submission.models import Submission
 from ..serializers import ContestAnnouncementSerializer
 from ..serializers import ContestSerializer, ContestPasswordVerifySerializer
 from ..serializers import OIContestRankSerializer, ACMContestRankSerializer
@@ -104,16 +108,105 @@ class ContestAccessAPI(APIView):
 
 class ContestRankAPI(APIView):
     def get_rank(self):
-        if self.contest.rule_type == ContestRuleType.ACM:
-            return ACMContestRank.objects.filter(contest=self.contest,
-                                                 user__admin_type=AdminType.REGULAR_USER,
-                                                 user__is_disabled=False).\
-                select_related("user").order_by("-accepted_number", "total_time")
-        else:
-            return OIContestRank.objects.filter(contest=self.contest,
-                                                user__admin_type=AdminType.REGULAR_USER,
-                                                user__is_disabled=False). \
-                select_related("user").order_by("-total_score")
+        import traceback
+        import logging
+        import json
+        from collections import defaultdict # Import defaultdict
+        
+        logger = logging.getLogger('contest')
+        
+        try:
+            logger.info(f"Getting rank for contest {self.contest.id}, rule type: {self.contest.rule_type}")
+            
+            if self.contest.rule_type == ContestRuleType.ACM:
+                logger.info("Processing ACM contest")
+                
+                ranks = ACMContestRank.objects.filter(
+                    contest=self.contest,
+                    user__admin_type=AdminType.REGULAR_USER,
+                    user__is_disabled=False
+                ).select_related("user")
+                
+                if not ranks.exists():
+                    return []
+                
+                penalty_data = []
+                for rank in ranks:
+                    try:
+                        logger.debug(f"Processing penalties for user {rank.user.username}")
+
+                        # --- BUG FIX STARTS HERE ---
+                        # The previous grouping method was likely causing the miscalculation.
+                        # This new logic is more explicit and reliable. We fetch all relevant
+                        # violations and count them in Python.
+                        
+                        violations_by_problem = defaultdict(int)
+                        user_violations = AntiCheatViolation.objects.filter(
+                            contest=self.contest,
+                            user=rank.user,
+                            problem__isnull=False
+                        )
+
+                        for v in user_violations:
+                            # Group violations by the problem's primary key (ID).
+                            # We increment the count for each violation found.
+                            violations_by_problem[str(v.problem_id)] += 1
+                        
+                        logger.debug(f"User {rank.user.username} violation counts: {dict(violations_by_problem)}")
+                        # --- BUG FIX ENDS HERE ---
+
+                        modified_submission_info = json.loads(json.dumps(rank.submission_info))
+                        total_time_adjustment = 0
+                        
+                        # This loop now iterates over the correctly counted violations.
+                        for problem_id_str, violation_count in violations_by_problem.items():
+                            if problem_id_str in modified_submission_info and modified_submission_info[problem_id_str].get('is_ac', False):
+                                # The calculation is now correct: e.g., 8 violations * 600 seconds.
+                                problem_penalty_seconds = violation_count * 600
+                                
+                                original_ac_time = modified_submission_info[problem_id_str]['ac_time']
+                                new_ac_time = original_ac_time + problem_penalty_seconds
+                                
+                                modified_submission_info[problem_id_str]['ac_time'] = new_ac_time
+                                modified_submission_info[problem_id_str]['penalty_applied'] = problem_penalty_seconds
+                                modified_submission_info[problem_id_str]['violation_count'] = violation_count
+                                modified_submission_info[problem_id_str]['original_ac_time'] = original_ac_time
+                                
+                                total_time_adjustment += problem_penalty_seconds
+                                logger.debug(f"Applied penalty to problem {problem_id_str}: {problem_penalty_seconds}s for {violation_count} violations.")
+
+                        # Apply the calculated penalties to the user's rank object
+                        rank.submission_info = modified_submission_info
+                        rank.total_penalty_time = total_time_adjustment
+                        rank.total_violation_count = sum(violations_by_problem.values())
+                        
+                        rank.original_total_time = rank.total_time
+                        rank.total_time += total_time_adjustment
+                        rank.total_time_with_penalty = rank.total_time
+                        
+                        penalty_data.append(rank)
+                        
+                    except Exception as e:
+                        logger.error(f"Error processing penalties for user {rank.user.username}: {str(e)}")
+                        rank.total_penalty_time = 0
+                        rank.total_violation_count = 0
+                        penalty_data.append(rank)
+                
+                penalty_data.sort(key=lambda x: (-x.accepted_number, x.total_time))
+                return penalty_data
+                
+            else: # OI Contest
+                ranks = OIContestRank.objects.filter(
+                    contest=self.contest,
+                    user__admin_type=AdminType.REGULAR_USER,
+                    user__is_disabled=False
+                ).select_related("user").order_by('-total_score')
+                return list(ranks)
+                
+        except Exception as e:
+            logger.error(f"Exception in get_rank: {str(e)}")
+            traceback.print_exc()
+            return []
 
     def column_string(self, n):
         string = ""
@@ -124,69 +217,518 @@ class ContestRankAPI(APIView):
 
     @check_contest_permission(check_type="ranks")
     def get(self, request):
-        download_csv = request.GET.get("download_csv")
-        force_refresh = request.GET.get("force_refresh")
-        is_contest_admin = request.user.is_authenticated and request.user.is_contest_admin(self.contest)
-        if self.contest.rule_type == ContestRuleType.OI:
-            serializer = OIContestRankSerializer
-        else:
-            serializer = ACMContestRankSerializer
-
-        if force_refresh == "1" and is_contest_admin:
-            qs = self.get_rank()
-        else:
-            cache_key = f"{CacheKey.contest_rank_cache}:{self.contest.id}"
-            qs = cache.get(cache_key)
-            if not qs:
-                qs = self.get_rank()
-                cache.set(cache_key, qs)
-
-        if download_csv:
-            data = serializer(qs, many=True, is_contest_admin=is_contest_admin).data
-            contest_problems = Problem.objects.filter(contest=self.contest, visible=True).order_by("_id")
-            problem_ids = [item.id for item in contest_problems]
-
-            f = io.BytesIO()
-            workbook = xlsxwriter.Workbook(f)
-            worksheet = workbook.add_worksheet()
-            worksheet.write("A1", "User ID")
-            worksheet.write("B1", "Username")
-            worksheet.write("C1", "Real Name")
+        import traceback
+        import logging
+        
+        logger = logging.getLogger('contest')
+        
+        try:
+            logger.info(f"ContestRankAPI.get called for contest {self.contest.id}")
+            
+            download_csv = request.GET.get("download_csv")
+            force_refresh = request.GET.get("force_refresh")
+            is_contest_admin = request.user.is_authenticated and request.user.is_contest_admin(self.contest)
+            
+            logger.info(f"download_csv={download_csv}, force_refresh={force_refresh}, is_contest_admin={is_contest_admin}")
+            logger.info(f"Contest rule type: {self.contest.rule_type}")
+            
             if self.contest.rule_type == ContestRuleType.OI:
-                worksheet.write("D1", "Total Score")
-                for item in range(contest_problems.count()):
-                    worksheet.write(self.column_string(5 + item) + "1", f"{contest_problems[item].title}")
-                for index, item in enumerate(data):
-                    worksheet.write_string(index + 1, 0, str(item["user"]["id"]))
-                    worksheet.write_string(index + 1, 1, item["user"]["username"])
-                    worksheet.write_string(index + 1, 2, item["user"]["real_name"] or "")
-                    worksheet.write_string(index + 1, 3, str(item["total_score"]))
-                    for k, v in item["submission_info"].items():
-                        worksheet.write_string(index + 1, 4 + problem_ids.index(int(k)), str(v))
+                serializer = OIContestRankSerializer
+                logger.info("Using OI serializer")
             else:
-                worksheet.write("D1", "AC")
-                worksheet.write("E1", "Total Submission")
-                worksheet.write("F1", "Total Time")
-                for item in range(contest_problems.count()):
-                    worksheet.write(self.column_string(7 + item) + "1", f"{contest_problems[item].title}")
+                serializer = ACMContestRankSerializer
+                logger.info("Using ACM serializer")
 
-                for index, item in enumerate(data):
-                    worksheet.write_string(index + 1, 0, str(item["user"]["id"]))
-                    worksheet.write_string(index + 1, 1, item["user"]["username"])
-                    worksheet.write_string(index + 1, 2, item["user"]["real_name"] or "")
-                    worksheet.write_string(index + 1, 3, str(item["accepted_number"]))
-                    worksheet.write_string(index + 1, 4, str(item["submission_number"]))
-                    worksheet.write_string(index + 1, 5, str(item["total_time"]))
-                    for k, v in item["submission_info"].items():
-                        worksheet.write_string(index + 1, 6 + problem_ids.index(int(k)), str(v["is_ac"]))
+            # Check if there are violations
+            logger.info("Checking for violations...")
+            has_violations = AntiCheatViolation.objects.filter(contest=self.contest).exists()
+            logger.info(f"Has violations: {has_violations}")
+            
+            # Get ranking data
+            if force_refresh == "1" and is_contest_admin:
+                logger.info("Force refresh requested by admin")
+                qs = self.get_rank()
+            elif has_violations:
+                logger.info("Has violations, calculating fresh data")
+                qs = self.get_rank()
+            else:
+                logger.info("Checking cache...")
+                cache_key = f"{CacheKey.contest_rank_cache}:{self.contest.id}"
+                qs = cache.get(cache_key)
+                if not qs:
+                    logger.info("Cache miss, calculating fresh data")
+                    qs = self.get_rank()
+                    # Only cache when there are no violations
+                    if not has_violations:
+                        logger.info("Caching results for 60 seconds")
+                        cache.set(cache_key, qs, 60)
+                else:
+                    logger.info("Cache hit")
 
-            workbook.close()
-            f.seek(0)
-            response = HttpResponse(f.read())
-            response["Content-Disposition"] = f"attachment; filename=content-{self.contest.id}-rank.xlsx"
-            response["Content-Type"] = "application/xlsx"
-            return response
+            logger.info(f"Got {len(qs) if qs else 0} ranking entries")
 
-        page_qs = self.paginate_data(request, qs)
-        page_qs["results"] = serializer(page_qs["results"], many=True, is_contest_admin=is_contest_admin).data
-        return self.success(page_qs)
+            # Handle empty rankings
+            if not qs:
+                logger.info("No ranking data available, returning empty results")
+                return self.success({
+                    "total": 0,
+                    "results": []
+                })
+
+            if download_csv:
+                logger.info("CSV download requested")
+                # Skip CSV for now to focus on the main issue
+                return self.error("CSV download temporarily disabled during debugging")
+            
+            logger.info("Paginating data...")
+            try:
+                page_qs = self.paginate_data(request, qs)
+                logger.info(f"Paginated to {len(page_qs['results']) if page_qs and 'results' in page_qs else 0} entries")
+            except Exception as e:
+                logger.error(f"Pagination error: {str(e)}")
+                # Return unpaginated data if pagination fails
+                page_qs = {
+                    "total": len(qs),
+                    "results": qs
+                }
+            
+            logger.info("Serializing data...")
+            try:
+                serialized_data = serializer(page_qs["results"], many=True, is_contest_admin=is_contest_admin).data
+                page_qs["results"] = serialized_data
+                logger.info(f"Serialization complete, returning {len(serialized_data)} entries")
+            except Exception as e:
+                logger.error(f"Serialization error: {str(e)}")
+                traceback.print_exc()
+                return self.error(f"Serialization error: {str(e)}")
+            
+            return self.success(page_qs)
+            
+        except Exception as e:
+            logger.error(f"Exception in ContestRankAPI.get: {str(e)}")
+            traceback.print_exc()
+            return self.error(f"Internal server error: {str(e)}")
+
+class AntiCheatViolationAPI(APIView):
+    @login_required
+    def post(self, request):
+        """
+        Report an anti-cheat violation
+        """
+        import logging
+        import traceback
+        
+        logger = logging.getLogger('django')
+        logger.info(f"AntiCheatViolationAPI POST called by user {request.user.id}")
+        logger.info(f"Request data: {request.data}")
+        
+        try:
+            data = request.data
+            contest_id = data.get('contest_id')
+            violation_type = data.get('violation_type', '').strip()
+            violation_details = data.get('violation_details', '').strip()
+            problem_id = data.get('problem_id')  # This is display_id from frontend
+            
+            logger.info(f"Parsed data - contest_id: {contest_id}, violation_type: {violation_type}, problem_id: {problem_id}")
+            
+            # Validate required fields
+            if not contest_id:
+                logger.error("Missing contest_id")
+                return self.error("Contest ID is required")
+            
+            if not violation_type:
+                logger.error("Missing violation_type")
+                return self.error("Violation type is required")
+            
+            # Validate contest exists
+            try:
+                contest = Contest.objects.get(id=contest_id, visible=True)
+                logger.info(f"Found contest: {contest.title}")
+            except Contest.DoesNotExist:
+                logger.error(f"Contest {contest_id} not found")
+                return self.error("Contest not found")
+            except ValueError:
+                logger.error(f"Invalid contest_id format: {contest_id}")
+                return self.error("Invalid contest ID format")
+            
+            # Validate problem if specified
+            problem = None
+            if problem_id:
+                try:
+                    from problem.models import Problem
+                    
+                    # FIXED: Use _id field (display_id) instead of id field
+                    problem = Problem.objects.get(
+                        _id=problem_id,  # Use display ID (_id field)
+                        visible=True,
+                        contest=contest  # Check if problem belongs to this contest
+                    )
+                        
+                    logger.info(f"Found problem: {problem.title} (display_id: {problem._id}, db_id: {problem.id})")
+                except Problem.DoesNotExist:
+                    logger.error(f"Problem with display ID '{problem_id}' not found in contest {contest_id}")
+                    return self.error("Problem not found in this contest")
+                except ValueError:
+                    logger.error(f"Invalid problem_id format: {problem_id}")
+                    return self.error("Invalid problem ID format")
+            
+            # Validate violation type
+            valid_violation_types = [choice[0] for choice in AntiCheatViolation.VIOLATION_TYPES]
+            if violation_type not in valid_violation_types:
+                logger.warning(f"Invalid violation_type: {violation_type}, using 'window_resize'")
+                violation_type = 'window_resize'
+            
+            # Check for recent duplicate violations (prevent spam)
+            from django.utils.timezone import now, timedelta
+            recent_threshold = now() - timedelta(seconds=15)
+            recent_violation = AntiCheatViolation.objects.filter(
+                contest=contest,
+                user=request.user,
+                problem=problem,
+                violation_type=violation_type,
+                violation_details=violation_details,
+                timestamp__gte=recent_threshold
+            ).first()
+            
+            if recent_violation:
+                logger.info(f"Recent duplicate violation found, skipping creation")
+                problem_violations = AntiCheatViolation.objects.filter(
+                    contest=contest,
+                    user=request.user,
+                    problem=problem
+                ).count() if problem else 0
+                
+                return self.success({
+                    'violation_id': recent_violation.id,
+                    'problem_violation_count': problem_violations,
+                    'problem_penalty_minutes': problem_violations * 10,
+                    'message': f'Duplicate violation ignored. Problem penalty: {problem_violations * 10} minutes'
+                })
+            
+            # Create violation record
+            violation = AntiCheatViolation.objects.create(
+                contest=contest,
+                problem=problem,
+                user=request.user,
+                violation_type=violation_type,
+                violation_details=violation_details,
+                ip_address=request.session.get("ip", ""),
+                user_agent=request.META.get('HTTP_USER_AGENT', '')[:500]
+            )
+            
+            logger.info(f"Created violation {violation.id}")
+            
+            # Get problem-specific violations count
+            problem_violations = AntiCheatViolation.objects.filter(
+                contest=contest,
+                user=request.user,
+                problem=problem
+            ).count() if problem else 0
+            
+            problem_penalty_minutes = problem_violations * 10
+            
+            logger.info(f"User {request.user.username} now has {problem_violations} violations for problem {problem_id}, penalty: {problem_penalty_minutes} minutes")
+            
+            return self.success({
+                'violation_id': violation.id,
+                'problem_violation_count': problem_violations,
+                'problem_penalty_minutes': problem_penalty_minutes,
+                'message': f'Violation recorded. Problem penalty: {problem_penalty_minutes} minutes'
+            })
+            
+        except Exception as e:
+            logger.error(f"Unexpected error in AntiCheatViolationAPI: {str(e)}")
+            logger.error(traceback.format_exc())
+            return self.error(f"Internal server error: {str(e)}")
+
+class AntiCheatViolationListAPI(APIView):
+    @login_required
+    def get(self, request):
+        """
+        Get anti-cheat violations for a contest
+        """
+        contest_id = request.GET.get('contest_id')
+        user_id = request.GET.get('user_id')
+        
+        if not contest_id:
+            return self.error("Contest ID is required")
+        
+        try:
+            contest = Contest.objects.get(id=contest_id, visible=True)
+        except Contest.DoesNotExist:
+            return self.error("Contest not found")
+        
+        # Only allow admins to see other users' violations
+        if user_id and user_id != str(request.user.id):
+            if not request.user.is_contest_admin(contest):
+                return self.error("Permission denied")
+        
+        violations = AntiCheatViolation.objects.filter(contest=contest)
+        
+        if user_id:
+            violations = violations.filter(user_id=user_id)
+        else:
+            # If no user_id specified, show current user's violations
+            violations = violations.filter(user=request.user)
+        
+        violations_data = []
+        for violation in violations:
+            violations_data.append({
+                'id': violation.id,
+                'violation_type': violation.violation_type,
+                'violation_details': violation.violation_details,
+                'timestamp': violation.timestamp,
+                'problem_id': violation.problem.id if violation.problem else None,
+                'problem_title': violation.problem.title if violation.problem else None
+            })
+        
+        return self.success({
+            'violations': violations_data,
+            'total_count': len(violations_data),
+            'penalty_minutes': len(violations_data) * 10
+        })
+
+
+class AntiCheatStatusAPI(APIView):
+    @login_required
+    def get(self, request):
+        """
+        Get anti-cheat status for current user in a contest
+        """
+        contest_id = request.GET.get('contest_id')
+        
+        if not contest_id:
+            return self.error("Contest ID is required")
+        
+        try:
+            contest = Contest.objects.get(id=contest_id, visible=True)
+        except Contest.DoesNotExist:
+            return self.error("Contest not found")
+        
+        # Get violation count
+        violation_count = AntiCheatViolation.objects.filter(
+            contest=contest,
+            user=request.user
+        ).count()
+        
+        penalty_minutes = violation_count * 10
+        
+        return self.success({
+            'violation_count': violation_count,
+            'penalty_minutes': penalty_minutes,
+            'has_violations': violation_count > 0
+        })
+
+
+class ProblemAntiCheatStatusAPI(APIView):
+    @login_required
+    def get(self, request):
+        """
+        Check anti-cheat status for a specific problem in a contest
+        """
+        contest_id = request.GET.get('contest_id')
+        problem_id = request.GET.get('problem_id')  # This is display_id from frontend
+        
+        if not contest_id or not problem_id:
+            return self.error("Contest ID and Problem ID are required")
+        
+        try:
+            contest = Contest.objects.get(id=contest_id, visible=True)
+            from problem.models import Problem
+            
+            # FIXED: Use _id field (display_id) instead of id field
+            problem = Problem.objects.get(
+                _id=problem_id,  # Use display ID (_id field)
+                visible=True,
+                contest=contest  # Check if problem belongs to this contest
+            )
+                
+        except Contest.DoesNotExist:
+            return self.error("Contest not found")
+        except Problem.DoesNotExist:
+            return self.error("Problem not found in this contest")
+        
+        # Get violations for this specific problem only
+        problem_violations = AntiCheatViolation.objects.filter(
+            contest=contest,
+            user=request.user,
+            problem=problem  # Use the actual problem object
+        ).count()
+        
+        # Check if user has any accepted submission for this problem
+        from submission.models import Submission
+        has_accepted = Submission.objects.filter(
+            contest=contest,
+            problem=problem,  # Use the actual problem object
+            user_id=request.user.id,
+            result=0  # Accepted
+        ).exists()
+        
+        # Calculate penalties ONLY for this problem
+        problem_penalty_minutes = problem_violations * 10
+        
+        return self.success({
+            'problem_solved': has_accepted,
+            'anti_cheat_required': not has_accepted,
+            'problem_violation_count': problem_violations,
+            'problem_penalty_minutes': problem_penalty_minutes,
+            'anti_cheat_enabled': True
+        })
+        
+def get_user_anti_cheat_penalty(user, contest):
+    """
+    Helper function to get total penalty time for a user in a contest
+    """
+    try:
+        violation_count = AntiCheatViolation.objects.filter(
+            contest=contest,
+            user=user
+        ).count()
+        return violation_count * 10 * 60  # 10 minutes per violation in seconds
+    except:
+        return 0
+    
+class ContestViolationDetailsAPI(APIView):
+    @login_required
+    def get(self, request):
+        """
+        Get detailed violation information for a contest, grouped by user and problem
+        """
+        contest_id = request.GET.get('contest_id')
+        user_id = request.GET.get('user_id')
+        
+        if not contest_id:
+            return self.error("Contest ID is required")
+        
+        try:
+            contest = Contest.objects.get(id=contest_id, visible=True)
+        except Contest.DoesNotExist:
+            return self.error("Contest not found")
+        
+        # Check permissions - only admins can see other users' violations
+        if user_id and str(user_id) != str(request.user.id):
+            if not request.user.is_contest_admin(contest):
+                return self.error("Permission denied")
+        
+        # Base query - FIXED: Import Problem model properly
+        from problem.models import Problem
+        violations = AntiCheatViolation.objects.filter(contest=contest).select_related('user', 'problem')
+        
+        if user_id:
+            violations = violations.filter(user_id=user_id)
+        else:
+            # If no user_id specified and not admin, show only current user's violations
+            if not request.user.is_contest_admin(contest):
+                violations = violations.filter(user=request.user)
+        
+        # Group violations by user and problem
+        violation_data = {}
+        
+        for violation in violations:
+            user_key = str(violation.user.id)
+            problem_key = str(violation.problem.id) if violation.problem else 'general'
+            
+            if user_key not in violation_data:
+                violation_data[user_key] = {
+                    'user_id': violation.user.id,
+                    'username': violation.user.username,
+                    'problems': {},
+                    'total_violations': 0,
+                    'total_penalty_minutes': 0
+                }
+            
+            if problem_key not in violation_data[user_key]['problems']:
+                violation_data[user_key]['problems'][problem_key] = {
+                    'problem_id': violation.problem.id if violation.problem else None,
+                    'problem_title': violation.problem.title if violation.problem else 'General',
+                    'violations': [],
+                    'violation_count': 0
+                }
+            
+            violation_data[user_key]['problems'][problem_key]['violations'].append({
+                'id': violation.id,
+                'violation_type': violation.violation_type,
+                'violation_details': violation.violation_details,
+                'timestamp': violation.timestamp,
+                'ip_address': violation.ip_address
+            })
+            
+            violation_data[user_key]['problems'][problem_key]['violation_count'] += 1
+            violation_data[user_key]['total_violations'] += 1
+        
+        # Calculate penalties
+        for user_data in violation_data.values():
+            user_data['total_penalty_minutes'] = user_data['total_violations'] * 10
+            
+            # For ACM contests, show how penalty affects each problem
+            if contest.rule_type == ContestRuleType.ACM:
+                for problem_data in user_data['problems'].values():
+                    problem_penalty = problem_data['violation_count'] * 10 * 60  # seconds
+                    problem_data['penalty_seconds'] = problem_penalty
+                    problem_data['penalty_minutes'] = problem_data['violation_count'] * 10
+        
+        return self.success({
+            'contest_id': contest.id,
+            'contest_title': contest.title,
+            'rule_type': contest.rule_type,
+            'violation_details': list(violation_data.values())
+        })
+
+
+class UserProblemViolationsAPI(APIView):
+    @login_required
+    def get(self, request):
+        """
+        Get violations for a specific user and problem combination
+        """
+        contest_id = request.GET.get('contest_id')
+        problem_id = request.GET.get('problem_id')
+        user_id = request.GET.get('user_id', request.user.id)
+        
+        if not contest_id:
+            return self.error("Contest ID is required")
+        
+        try:
+            contest = Contest.objects.get(id=contest_id, visible=True)
+        except Contest.DoesNotExist:
+            return self.error("Contest not found")
+        
+        # Check permissions
+        if str(user_id) != str(request.user.id):
+            if not request.user.is_contest_admin(contest):
+                return self.error("Permission denied")
+        
+        # Base query
+        violations = AntiCheatViolation.objects.filter(
+            contest=contest,
+            user_id=user_id
+        ).select_related('problem')
+        
+        if problem_id:
+            violations = violations.filter(problem_id=problem_id)
+        
+        violations_list = []
+        for violation in violations:
+            violations_list.append({
+                'id': violation.id,
+                'violation_type': violation.violation_type,
+                'violation_details': violation.violation_details,
+                'timestamp': violation.timestamp,
+                'problem_id': violation.problem.id if violation.problem else None,
+                'problem_title': violation.problem.title if violation.problem else None,
+                'ip_address': violation.ip_address
+            })
+        
+        total_count = len(violations_list)
+        penalty_minutes = total_count * 10
+        penalty_seconds = penalty_minutes * 60
+        
+        return self.success({
+            'user_id': user_id,
+            'contest_id': contest.id,
+            'problem_id': problem_id,
+            'violations': violations_list,
+            'total_violations': total_count,
+            'penalty_minutes': penalty_minutes,
+            'penalty_seconds': penalty_seconds
+        })

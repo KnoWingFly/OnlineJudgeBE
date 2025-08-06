@@ -99,3 +99,31 @@ class ContestAnnouncement(models.Model):
     class Meta:
         db_table = "contest_announcement"
         ordering = ("-create_time",)
+
+class AntiCheatViolation(models.Model):
+    VIOLATION_TYPES = (
+        ('fullscreen_exit', 'Exited Fullscreen'),
+        ('tab_switch', 'Switched Tab/Window'),
+        ('dev_tools', 'Opened Developer Tools'),
+        ('forbidden_keys', 'Pressed Forbidden Keys'),
+        ('context_menu', 'Opened Context Menu'),
+        ('window_blur', 'Window Lost Focus'),
+        ('page_leave', 'Attempted to Leave Page'),
+        ('window_resize', 'Suspicious Window Resize'),
+    )
+    
+    contest = models.ForeignKey('Contest', on_delete=models.CASCADE)
+    problem = models.ForeignKey('problem.Problem', on_delete=models.CASCADE, null=True, blank=True)
+    user = models.ForeignKey(User, on_delete=models.CASCADE)
+    violation_type = models.CharField(max_length=50, choices=VIOLATION_TYPES)
+    violation_details = models.TextField(blank=True)
+    timestamp = models.DateTimeField(auto_now_add=True)
+    ip_address = models.GenericIPAddressField(null=True, blank=True)
+    user_agent = models.TextField(blank=True)
+    
+    class Meta:
+        db_table = 'anti_cheat_violation'
+        ordering = ['-timestamp']
+        
+    def __str__(self):
+        return f"{self.user.username} - {self.violation_type} in {self.contest.title}"
