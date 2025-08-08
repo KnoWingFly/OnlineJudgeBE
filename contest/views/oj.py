@@ -7,6 +7,7 @@ from django.http import HttpResponse
 from django.utils.timezone import now
 from django.core.cache import cache
 from django.db.models import Count, Q
+from django.db import models
 
 from problem.models import Problem
 from utils.api import APIView, validate_serializer
@@ -16,11 +17,12 @@ from account.models import AdminType
 from account.decorators import login_required, check_contest_permission, check_contest_password
 
 from utils.constants import ContestRuleType, ContestStatus
-from ..models import ContestAnnouncement, Contest, OIContestRank, ACMContestRank, AntiCheatViolation
+from ..models import ContestAnnouncement, Contest, OIContestRank, ACMContestRank, AntiCheatViolation, ContestReview
 from submission.models import Submission
 from ..serializers import ContestAnnouncementSerializer
 from ..serializers import ContestSerializer, ContestPasswordVerifySerializer
 from ..serializers import OIContestRankSerializer, ACMContestRankSerializer
+from ..serializers import ContestReviewSerializer, CreateContestReviewSerializer
 
 
 class ContestAnnouncementListAPI(APIView):
@@ -131,15 +133,14 @@ class ContestRankAPI(APIView):
                     return []
                 
                 penalty_data = []
+                # Check contest status once before the loop
+                is_contest_ended = self.contest.status == ContestStatus.CONTEST_ENDED
+
                 for rank in ranks:
                     try:
                         logger.debug(f"Processing penalties for user {rank.user.username}")
 
-                        # --- BUG FIX STARTS HERE ---
-                        # The previous grouping method was likely causing the miscalculation.
-                        # This new logic is more explicit and reliable. We fetch all relevant
-                        # violations and count them in Python.
-                        
+                        # --- BUG FIX STARTS HERE --- (Existing code)
                         violations_by_problem = defaultdict(int)
                         user_violations = AntiCheatViolation.objects.filter(
                             contest=self.contest,
@@ -148,8 +149,6 @@ class ContestRankAPI(APIView):
                         )
 
                         for v in user_violations:
-                            # Group violations by the problem's primary key (ID).
-                            # We increment the count for each violation found.
                             violations_by_problem[str(v.problem_id)] += 1
                         
                         logger.debug(f"User {rank.user.username} violation counts: {dict(violations_by_problem)}")
@@ -158,10 +157,8 @@ class ContestRankAPI(APIView):
                         modified_submission_info = json.loads(json.dumps(rank.submission_info))
                         total_time_adjustment = 0
                         
-                        # This loop now iterates over the correctly counted violations.
                         for problem_id_str, violation_count in violations_by_problem.items():
                             if problem_id_str in modified_submission_info and modified_submission_info[problem_id_str].get('is_ac', False):
-                                # The calculation is now correct: e.g., 8 violations * 600 seconds.
                                 problem_penalty_seconds = violation_count * 600
                                 
                                 original_ac_time = modified_submission_info[problem_id_str]['ac_time']
@@ -174,10 +171,24 @@ class ContestRankAPI(APIView):
                                 
                                 total_time_adjustment += problem_penalty_seconds
                                 logger.debug(f"Applied penalty to problem {problem_id_str}: {problem_penalty_seconds}s for {violation_count} violations.")
+                        
+                        # --- NEW: PENALTY FOR NO REVIEW ---
+                        review_penalty_seconds = 0
+                        # Only apply the penalty if the contest has officially ended.
+                        if is_contest_ended:
+                            review_exists = ContestReview.objects.filter(contest=self.contest, user=rank.user).exists()
+                            if not review_exists:
+                                review_penalty_seconds = 3600  # 60 minutes * 60 seconds
+                                total_time_adjustment += review_penalty_seconds
+                                logger.info(f"User {rank.user.username} has no review, applying {review_penalty_seconds}s penalty.")
+                        
+                        # Add penalty info to the rank object for the serializer
+                        rank.review_penalty_applied = review_penalty_seconds
+                        # --- END NEW LOGIC ---
 
                         # Apply the calculated penalties to the user's rank object
                         rank.submission_info = modified_submission_info
-                        rank.total_penalty_time = total_time_adjustment
+                        rank.total_penalty_time = total_time_adjustment # Now includes both anti-cheat and review penalties
                         rank.total_violation_count = sum(violations_by_problem.values())
                         
                         rank.original_total_time = rank.total_time
@@ -196,6 +207,8 @@ class ContestRankAPI(APIView):
                 return penalty_data
                 
             else: # OI Contest
+                # Note: A time-based penalty is not applicable to OI contests as they are score-based.
+                # A score deduction would be a more suitable penalty for this rule type.
                 ranks = OIContestRank.objects.filter(
                     contest=self.contest,
                     user__admin_type=AdminType.REGULAR_USER,
@@ -731,4 +744,205 @@ class UserProblemViolationsAPI(APIView):
             'total_violations': total_count,
             'penalty_minutes': penalty_minutes,
             'penalty_seconds': penalty_seconds
+        })
+        
+class ContestReviewAPI(APIView):
+    @login_required
+    def post(self, request):
+        """
+        Submit or update a contest review
+        """
+        import logging
+        logger = logging.getLogger('django')
+        
+        try:
+            data = request.data.copy()
+            contest_id = data.get('contest_id')
+            
+            if not contest_id:
+                return self.error("Contest ID is required")
+            
+            # Validate contest exists and user can access it
+            try:
+                contest = Contest.objects.get(id=contest_id, visible=True)
+            except Contest.DoesNotExist:
+                return self.error("Contest not found")
+            
+            # Check if user participated in contest (optional validation)
+            # You might want to add this check based on your requirements
+            # has_participated = Submission.objects.filter(
+            #     contest=contest, user=request.user
+            # ).exists()
+            # if not has_participated:
+            #     return self.error("You must participate in the contest to submit a review")
+            
+            # Set contest and user
+            data['contest'] = contest.id
+            
+            # Check if review already exists
+            existing_review = ContestReview.objects.filter(
+                contest=contest, user=request.user
+            ).first()
+            
+            if existing_review:
+                # Update existing review
+                serializer = CreateContestReviewSerializer(existing_review, data=data, partial=False)
+                action = "updated"
+            else:
+                # Create new review
+                serializer = CreateContestReviewSerializer(data=data)
+                action = "created"
+            
+            if serializer.is_valid():
+                review = serializer.save(
+                    user=request.user,
+                    ip_address=request.session.get("ip", "")
+                )
+                
+                logger.info(f"Contest review {action} by user {request.user.username} for contest {contest.title}")
+                
+                return self.success({
+                    'message': f'Review {action} successfully',
+                    'review': ContestReviewSerializer(review).data
+                })
+            else:
+                return self.error("Validation failed", data=serializer.errors)
+                
+        except Exception as e:
+            logger.error(f"Error in ContestReviewAPI.post: {str(e)}")
+            return self.error(f"Internal server error: {str(e)}")
+    
+    @login_required 
+    def get(self, request):
+        """
+        Get user's review for a contest
+        """
+        contest_id = request.GET.get('contest_id')
+        
+        if not contest_id:
+            return self.error("Contest ID is required")
+        
+        try:
+            contest = Contest.objects.get(id=contest_id, visible=True)
+        except Contest.DoesNotExist:
+            return self.error("Contest not found")
+        
+        try:
+            review = ContestReview.objects.get(contest=contest, user=request.user)
+            return self.success(ContestReviewSerializer(review).data)
+        except ContestReview.DoesNotExist:
+            return self.success(None)  # No review found
+
+
+class ContestReviewListAPI(APIView):
+    def get(self, request):
+        """
+        Get all reviews for a contest (for admin/public viewing)
+        """
+        contest_id = request.GET.get('contest_id')
+        
+        if not contest_id:
+            return self.error("Contest ID is required")
+        
+        try:
+            contest = Contest.objects.get(id=contest_id, visible=True)
+        except Contest.DoesNotExist:
+            return self.error("Contest not found")
+        
+        # Check permissions - only admins can see all reviews
+        if not request.user.is_authenticated or not request.user.is_contest_admin(contest):
+            return self.error("Permission denied")
+        
+        reviews = ContestReview.objects.filter(contest=contest).select_related('user')
+        
+        # Add summary statistics
+        total_reviews = reviews.count()
+        if total_reviews > 0:
+            avg_rating = reviews.aggregate(
+                avg_rating=models.Avg('rating')
+            )['avg_rating']
+            
+            rating_distribution = {}
+            for i in range(1, 11):
+                rating_distribution[str(i)] = reviews.filter(rating=i).count()
+        else:
+            avg_rating = 0
+            rating_distribution = {}
+        
+        return self.success({
+            'reviews': self.paginate_data(request, reviews, ContestReviewSerializer)['results'],
+            'total_reviews': total_reviews,
+            'average_rating': round(avg_rating, 2) if avg_rating else 0,
+            'rating_distribution': rating_distribution
+        })
+
+
+class ContestReviewStatsAPI(APIView):
+    def get(self, request):
+        """
+        Get review statistics for a contest
+        """
+        contest_id = request.GET.get('contest_id')
+        
+        if not contest_id:
+            return self.error("Contest ID is required")
+        
+        try:
+            contest = Contest.objects.get(id=contest_id, visible=True)
+        except Contest.DoesNotExist:
+            return self.error("Contest not found")
+        
+        # Public stats (no authentication required)
+        reviews = ContestReview.objects.filter(contest=contest)
+        total_reviews = reviews.count()
+        
+        if total_reviews == 0:
+            return self.success({
+                'total_reviews': 0,
+                'average_rating': 0,
+                'rating_distribution': {},
+                'category_averages': {}
+            })
+        
+        # Calculate statistics
+        avg_rating = reviews.aggregate(avg_rating=models.Avg('rating'))['avg_rating']
+        
+        # Rating distribution
+        rating_distribution = {}
+        for i in range(1, 11):
+            count = reviews.filter(rating=i).count()
+            rating_distribution[str(i)] = {
+                'count': count,
+                'percentage': round((count / total_reviews) * 100, 1)
+            }
+        
+        # Category averages
+        category_averages = {}
+        categories = ['user_interface', 'performance', 'problem_quality', 'judging_accuracy']
+        
+        for category in categories:
+            ratings = []
+            for review in reviews:
+                if review.category_ratings and category in review.category_ratings:
+                    ratings.append(review.category_ratings[category])
+            
+            if ratings:
+                category_averages[category] = {
+                    'average': round(sum(ratings) / len(ratings), 2),
+                    'count': len(ratings)
+                }
+            else:
+                category_averages[category] = {
+                    'average': 0,
+                    'count': 0
+                }
+        
+        return self.success({
+            'contest_id': contest.id,
+            'contest_title': contest.title,
+            'total_reviews': total_reviews,
+            'average_rating': round(avg_rating, 2),
+            'rating_distribution': rating_distribution,
+            'category_averages': category_averages,
+            'technical_issues_count': reviews.filter(had_technical_issues=True).count()
         })

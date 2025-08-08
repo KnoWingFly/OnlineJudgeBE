@@ -2,6 +2,7 @@ from utils.api import UsernameSerializer, serializers
 
 from .models import Contest, ContestAnnouncement, ContestRuleType
 from .models import ACMContestRank, OIContestRank
+from .models import ContestReview
 
 
 class CreateConetestSeriaizer(serializers.Serializer):
@@ -86,9 +87,6 @@ class ACMContestRankSerializer(serializers.ModelSerializer):
         return UsernameSerializer(obj.user, need_real_name=self.is_contest_admin).data
     
     def to_representation(self, instance):
-        # `super().to_representation()` serializes the instance's fields.
-        # Since `get_rank` has already modified `instance.total_time` and `instance.submission_info`
-        # in memory, `data` will already contain the penalized values for these keys.
         data = super().to_representation(instance)
 
         # Check if the instance was processed by the penalty logic in `get_rank`.
@@ -98,6 +96,10 @@ class ACMContestRankSerializer(serializers.ModelSerializer):
             data['total_violation_count'] = instance.total_violation_count
             data['total_penalty_time'] = instance.total_penalty_time
             
+            # --- NEW: ADD REVIEW PENALTY TO RESPONSE ---
+            # Expose the specific penalty for not submitting a review.
+            data['review_penalty_applied'] = getattr(instance, 'review_penalty_applied', 0)
+            
             # For admins, expose the original total_time for comparison.
             if self.is_contest_admin:
                 data['original_total_time'] = instance.original_total_time
@@ -106,6 +108,7 @@ class ACMContestRankSerializer(serializers.ModelSerializer):
             # Provide default zero-value fields so the frontend doesn't break.
             data['total_violation_count'] = 0
             data['total_penalty_time'] = 0
+            data['review_penalty_applied'] = 0 # Default value
             if self.is_contest_admin:
                 data['original_total_time'] = instance.total_time
                 
@@ -208,3 +211,48 @@ class UserViolationSummarySerializer(serializers.Serializer):
     total_violations = serializers.IntegerField()
     total_penalty_minutes = serializers.IntegerField()
     problems = serializers.DictField()  # Will contain problem-specific violation data
+    
+class ContestReviewSerializer(serializers.ModelSerializer):
+    username = serializers.CharField(source='user.username', read_only=True)
+    user_id = serializers.IntegerField(source='user.id', read_only=True)
+    contest_title = serializers.CharField(source='contest.title', read_only=True)
+    
+    class Meta:
+        model = ContestReview
+        fields = [
+            'id', 'contest', 'user', 'username', 'user_id', 'contest_title',
+            'rating', 'category_ratings', 'review_text', 
+            'had_technical_issues', 'technical_issues_detail',
+            'submitted_at', 'updated_at'
+        ]
+        read_only_fields = ['user', 'submitted_at', 'updated_at']
+
+class CreateContestReviewSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ContestReview
+        fields = [
+            'contest', 'rating', 'category_ratings', 'review_text',
+            'had_technical_issues', 'technical_issues_detail'
+        ]
+        
+    def validate_rating(self, value):
+        if not (1 <= value <= 10):
+            raise serializers.ValidationError("Rating must be between 1 and 10")
+        return value
+        
+    def validate_review_text(self, value):
+        if len(value.strip()) < 10:
+            raise serializers.ValidationError("Review text must be at least 10 characters long")
+        return value.strip()
+        
+    def validate_category_ratings(self, value):
+        """Validate category ratings"""
+        valid_categories = ['user_interface', 'performance', 'problem_quality', 'judging_accuracy']
+        
+        for category, rating in value.items():
+            if category not in valid_categories:
+                raise serializers.ValidationError(f"Invalid category: {category}")
+            if not isinstance(rating, int) or not (1 <= rating <= 5):
+                raise serializers.ValidationError(f"Category rating for {category} must be between 1 and 5")
+        
+        return value

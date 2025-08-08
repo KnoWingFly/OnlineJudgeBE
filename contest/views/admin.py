@@ -14,11 +14,11 @@ from utils.cache import cache
 from utils.constants import CacheKey
 from utils.shortcuts import rand_str
 from utils.tasks import delete_files
-from ..models import Contest, ContestAnnouncement, ACMContestRank
+from ..models import Contest, ContestAnnouncement, ACMContestRank, ContestReview
 from ..serializers import (ContestAnnouncementSerializer, ContestAdminSerializer,
                            CreateConetestSeriaizer, CreateContestAnnouncementSerializer,
                            EditConetestSeriaizer, EditContestAnnouncementSerializer,
-                           ACMContesHelperSerializer, )
+                           ACMContesHelperSerializer,ContestReviewSerializer )
 
 
 class ContestAPI(APIView):
@@ -239,3 +239,96 @@ class DownloadContestSubmissions(APIView):
         resp["Content-Type"] = "application/zip"
         resp["Content-Disposition"] = f"attachment;filename={os.path.basename(zip_path)}"
         return resp
+
+class ContestReviewAdminAPI(APIView):
+    @check_contest_permission(check_type="admin")
+    def get(self, request):
+        """
+        Get contest reviews for admin with filtering and pagination
+        """
+        contest_id = request.GET.get("contest_id")
+        if not contest_id:
+            return self.error("Contest ID is required")
+            
+        try:
+            contest = Contest.objects.get(id=contest_id)
+            ensure_created_by(contest, request.user)
+        except Contest.DoesNotExist:
+            return self.error("Contest does not exist")
+        
+        reviews = ContestReview.objects.filter(contest=contest).select_related('user')
+        
+        # Apply filters
+        rating_filter = request.GET.get("rating_filter")
+        if rating_filter == "high":
+            reviews = reviews.filter(rating__gte=8)
+        elif rating_filter == "medium":
+            reviews = reviews.filter(rating__gte=5, rating__lt=8)
+        elif rating_filter == "low":
+            reviews = reviews.filter(rating__lt=5)
+            
+        technical_issues = request.GET.get("technical_issues")
+        if technical_issues == "true":
+            reviews = reviews.filter(had_technical_issues=True)
+        elif technical_issues == "false":
+            reviews = reviews.filter(had_technical_issues=False)
+        
+        return self.success(self.paginate_data(request, reviews, ContestReviewSerializer))
+
+class ContestReviewStatsAdminAPI(APIView):
+    @check_contest_permission(check_type="admin")
+    def get(self, request):
+        """
+        Get contest review statistics for admin
+        """
+        contest_id = request.GET.get("contest_id")
+        if not contest_id:
+            return self.error("Contest ID is required")
+            
+        try:
+            contest = Contest.objects.get(id=contest_id)
+            ensure_created_by(contest, request.user)
+        except Contest.DoesNotExist:
+            return self.error("Contest does not exist")
+        
+        from django.db.models import Avg, Count
+        
+        reviews = ContestReview.objects.filter(contest=contest)
+        stats = reviews.aggregate(
+            total_reviews=Count('id'),
+            average_rating=Avg('rating')
+        )
+        
+        # Additional stats
+        technical_issues_count = reviews.filter(had_technical_issues=True).count()
+        rating_distribution = {
+            'high': reviews.filter(rating__gte=8).count(),
+            'medium': reviews.filter(rating__gte=5, rating__lt=8).count(),
+            'low': reviews.filter(rating__lt=5).count()
+        }
+        
+        # Category averages
+        category_averages = {}
+        if reviews.exists():
+            all_categories = set()
+            for review in reviews:
+                if review.category_ratings:
+                    all_categories.update(review.category_ratings.keys())
+            
+            for category in all_categories:
+                ratings = []
+                for review in reviews:
+                    if review.category_ratings and category in review.category_ratings:
+                        ratings.append(review.category_ratings[category])
+                if ratings:
+                    category_averages[category] = sum(ratings) / len(ratings)
+        
+        result = {
+            **stats,
+            'technical_issues_count': technical_issues_count,
+            'rating_distribution': rating_distribution,
+            'category_averages': category_averages,
+            'average_rating': round(stats['average_rating'] or 0, 2)
+        }
+        
+        return self.success(result)

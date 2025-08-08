@@ -127,3 +127,40 @@ class AntiCheatViolation(models.Model):
         
     def __str__(self):
         return f"{self.user.username} - {self.violation_type} in {self.contest.title}"
+    
+# Add this to your contest/models.py file
+
+class ContestReview(models.Model):
+    contest = models.ForeignKey(Contest, on_delete=models.CASCADE, related_name='reviews')
+    user = models.ForeignKey(User, on_delete=models.CASCADE)
+    
+    # Rating fields
+    rating = models.IntegerField()  # Overall rating (1-10)
+    category_ratings = JSONField(default=dict)  # Category-specific ratings
+    
+    # Review content
+    review_text = models.TextField()
+    
+    # Additional questions
+    had_technical_issues = models.BooleanField(default=False)
+    technical_issues_detail = models.TextField(blank=True)
+    
+    # Metadata
+    submitted_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    ip_address = models.GenericIPAddressField(null=True, blank=True)
+    
+    class Meta:
+        db_table = 'contest_review'
+        unique_together = ('contest', 'user')  # One review per user per contest
+        ordering = ['-submitted_at']
+        
+    def __str__(self):
+        return f"{self.user.username}'s review for {self.contest.title} ({self.rating}/10)"
+    
+    @property
+    def average_category_rating(self):
+        """Calculate average of all category ratings"""
+        if not self.category_ratings:
+            return 0
+        return sum(self.category_ratings.values()) / len(self.category_ratings)
