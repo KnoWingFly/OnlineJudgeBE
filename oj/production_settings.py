@@ -18,6 +18,10 @@ REDIS_CONF = {
 
 DEBUG = False
 
-ALLOWED_HOSTS = ['*']
+ALLOWED_HOSTS = ["www.codeclash.page", "codeclash.page"]
+CSRF_TRUSTED_ORIGINS = ["https://www.codeclash.page", "https://codeclash.page"]
 
 DATA_DIR = "/data"
+
+SESSION_COOKIE_SECURE = True
+CSRF_COOKIE_SECURE = True
